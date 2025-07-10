@@ -14,15 +14,21 @@ So I write this program to help extract the zip file in the elder zip format.
 
 The program will try to docode file path with all encodings untill find the right one, or it gives an error.
 
-The program takes 2 arguments:
-* 1st is path of zip file
-* 2ed is folder to place the extracted files
-
-The 2ed argument can be empty, uncompressed file would be placed in the parent folder of zip file without the 2ed argument.
-
-Example:
-
-`zip_encode_test a.zip ./foo/`
+Usage show below:
+```
+usage:
+extract : {0} x <zip_file_path> [output_folder] [encoding]
+    Extracts files from a zip archive with specified encoding.
+    If no encoding is specified, it will try to decode with the first possible encodings.
+        If no possible encodings, an error is print.
+    If output_folder is not specified, it will use the parent directory of the zip file.
+test : {0} t <zip_file_path>
+    Tests all possible encodings of the zip archive and print it.
+show : {0} s <zip_file_path> [encoding]
+    Show the possible encodings of zip archive and lists file names decoded with them.
+    If encoding is specified, it will only list file path decoded with specify encoding.
+```
+`{0}`is the exectutable.
 
 ## Contribute
 
