@@ -1,166 +1,232 @@
-use zip;
+// ...existing code...
+mod unziptools;
+use egui::{self, ComboBox, FontData, FontDefinitions, FontFamily};
 use encoding_rs::*;
+use rfd::FileDialog;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use zip::ZipArchive;
 
-const ENCODINGS : &'static [&'static Encoding] = &[
-    UTF_8, GB18030, GBK, BIG5, EUC_JP, EUC_KR, IBM866, ISO_2022_JP, ISO_8859_10, ISO_8859_13, ISO_8859_14, ISO_8859_15,
-    ISO_8859_16, ISO_8859_2, ISO_8859_3, ISO_8859_4, ISO_8859_5, ISO_8859_6, ISO_8859_7, ISO_8859_8, ISO_8859_8_I,
-    KOI8_R, KOI8_U, SHIFT_JIS, UTF_16BE, UTF_16LE, MACINTOSH, REPLACEMENT, WINDOWS_1250, WINDOWS_1251, WINDOWS_1252,
-    WINDOWS_1253, WINDOWS_1254, WINDOWS_1255, WINDOWS_1256, WINDOWS_1257, WINDOWS_1258, WINDOWS_874, X_MAC_CYRILLIC
-];
-
-fn get_possible_encodings(zip_path: &std::path::Path) -> Vec<&'static Encoding>{
-    let mut encodings = ENCODINGS.to_vec();
-    let file = std::fs::File::open(zip_path).unwrap_or_else(|e| {
-        eprintln!("Error: Could not open zip file: {}", e);
-        std::process::exit(1);
-    });
-    let mut zip_archive = zip::ZipArchive::new(file).unwrap_or_else(|e| {
-        eprintln!("Error: Could not read zip archive: {}", e);
-        std::process::exit(1);
-    });
-    for i in 0..zip_archive.len() {
-        let file = zip_archive.by_index(i).unwrap_or_else(|e| {
-            eprintln!("Error: Could not read file at index {}: {}", i, e);
-            std::process::exit(1);
-        });
-        let raw_bytes = file.name_raw().to_owned();
-        encodings.retain(|&encoding| {
-            let (decoded, _, had_errors) = encoding.decode(&raw_bytes);
-            !had_errors && !decoded.is_empty()
-        });
-    }
-    encodings
+struct ZipExtractor {
+    zip_path: std::path::PathBuf,
+    zip_archive: Option<ZipArchive<File>>,
+    current_encoding: Option<&'static Encoding>,
+    possible_encodings: Vec<&'static Encoding>,
+    other_encodings: Vec<&'static Encoding>,
+    zip_file_names: Vec<String>,
+    // veriable to bind with ui
+    ui_encoding: Option<&'static Encoding>,
 }
 
-fn print_file_path_with_decoding(zip_path: &std::path::Path, encoding: &'static Encoding) {
-    let file = std::fs::File::open(zip_path).unwrap_or_else(|e| {
-        eprintln!("Error: Could not open zip file: {}", e);
-        std::process::exit(1);
-    });
-    let mut zip_archive = zip::ZipArchive::new(file).unwrap_or_else(|e| {
-        eprintln!("Error: Could not read zip archive: {}", e);
-        std::process::exit(1);
-    });
-    println!("List file path with encoding : {}", encoding.name());
-    for i in 0..zip_archive.len() {
-        let file = zip_archive.by_index(i).unwrap_or_else(|e| {
-            eprintln!("Error: Could not read file at index {}: {}", i, e);
-            std::process::exit(1);
-        });
-        let raw_bytes = file.name_raw().to_owned();
-        let (decoded_name, _, has_error) = encoding.decode(&raw_bytes);
-        if has_error {
-            eprintln!("Error : decoding file name error!");
-            continue;
-        }
-        println!("File : {}", decoded_name);
-    }
-}
+impl eframe::App for ZipExtractor {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Open").clicked() {
+                    if let Some(path) = FileDialog::new().add_filter("zip", &["zip"]).pick_file() {
+                        match File::open(path.as_path()) {
+                            Ok(f) => match ZipArchive::new(f) {
+                                Ok(za) => {
+                                    self.zip_archive = Some(za);
+                                    self.zip_path =
+                                        path.parent().unwrap_or(Path::new(".")).to_path_buf();
+                                    if unziptools::is_all_utf8_encoded(self.zip_archive.as_mut().unwrap()) {
+                                        self.possible_encodings.push(UTF_8);
+                                    } else {
+                                        self.possible_encodings =
+                                            unziptools::get_possible_encodings(
+                                                self.zip_archive.as_mut().unwrap(),
+                                            );
+                                    }
+                                    if !self.possible_encodings.is_empty() {
+                                        self.current_encoding = Some(self.possible_encodings[0]);
+                                        self.other_encodings = unziptools::ENCODINGS
+                                            .iter()
+                                            .cloned()
+                                            .filter(|&e| !self.possible_encodings.contains(&e))
+                                            .collect();
+                                        self.ui_encoding = self.current_encoding;
+                                        self.zip_file_names = unziptools::get_decoded_file_names(
+                                            self.zip_archive.as_mut().unwrap(),
+                                            self.current_encoding.unwrap_or(UTF_8),
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to read zip: {}", e);
+                                }
+                            },
+                            Err(e) => {
+                                eprintln!("Failed to open file: {}", e);
+                            }
+                        }
+                    }
+                }
 
-fn unzip_file_with(zip_path: &std::path::Path, output_folder: &std::path::Path, encoding: &'static Encoding) -> Result<(), zip::result::ZipError> {
-    let file = std::fs::File::open(zip_path)?;
-    let mut zip_archive = zip::ZipArchive::new(file)?;
-    for i in 0..zip_archive.len() {
-        let mut file = zip_archive.by_index(i)?;
-        let raw_bytes = file.name_raw().to_owned();
-        let (decoded_name, _, has_error) = encoding.decode(&raw_bytes);
-        if has_error {
-            eprintln!("Error decoding file name with all encodings");
-            return Err(zip::result::ZipError::InvalidArchive(std::borrow::Cow::Borrowed("Failed to decode file name")));
-        }
-        let decoded_path = std::path::Path::new(decoded_name.as_ref());
-        let output_path = output_folder.join(decoded_path);
-        if file.name().ends_with('/') {
-            std::fs::create_dir_all(&output_path)?;
-        } else {
-            if let Some(p) = output_path.parent() {
-                std::fs::create_dir_all(p)?;
-            }
-            let mut outfile = std::fs::File::create(&output_path)?;
-            std::io::copy(&mut file, &mut outfile)?;
-        }
-        println!("Extracted: {}", output_path.display());
-    }
-    Ok(())
-}
-
-const USAGE: &str = r#"usage:
-extract : {0} x <zip_file_path> [output_folder] [encoding]
-    Extracts files from a zip archive with specified encoding.
-    If no encoding is specified, it will try to decode with the first possible encodings.
-        If no possible encodings, an error is print.
-    If output_folder is not specified, it will use the parent directory of the zip file.
-test : {0} t <zip_file_path>
-    Tests all possible encodings of the zip archive and print it.
-show : {0} s <zip_file_path> [encoding]
-    Show the possible encodings of zip archive and lists file names decoded with them.
-    If encoding is specified, it will only list file path decoded with specify encoding.
-"#;
-
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("{}", USAGE.replace("{0}", &args[0]));
-        std::process::exit(1);
-    }
-    let option = args[1].as_str();
-    match option {
-        "x" => {
-            let zip_path = std::path::Path::new(&args[2]);
-            let output_folder = if args.len() > 3 {
-                std::path::Path::new(&args[3])
-            } else {
-                zip_path.parent().unwrap_or_else(|| {
-                    eprintln!("Error: No output folder specified and zip file has no parent directory.");
-                    std::process::exit(1);
-                })
-            };
-            let encoding = if args.len() > 4 {
-                let enc_name = &args[4];
-                ENCODINGS.iter().find(|e| e.name() == enc_name.as_str()).copied().unwrap_or_else(|| {
-                    eprintln!("Error: Encoding '{}' not found. Using UTF-8 as default.", enc_name);
-                    std::process::exit(1);
-                })
-            } else {
-                *get_possible_encodings(zip_path).first().unwrap_or_else(|| {
-                    eprintln!("Error: No possible encodings found for the zip file.");
-                    std::process::exit(1);
-                })
-            };
-            unzip_file_with(zip_path, output_folder, encoding).unwrap_or_else(|e| {
-                eprintln!("Error extracting zip file: {}", e);
-                std::process::exit(1);
+                if self.zip_archive.is_some() && self.current_encoding.is_some() {
+                    if ui.button("Extract").clicked() {
+                        // select output folder and extract
+                        if let Some(output_folder) = FileDialog::new()
+                            .set_directory(self.zip_path.as_path())
+                            .pick_folder()
+                        {
+                            if let (Some(archive), Some(encoding)) =
+                                (&mut self.zip_archive, self.current_encoding)
+                            {
+                                match unziptools::unzip_file_with(archive, &output_folder, encoding)
+                                {
+                                    Ok(_) => {
+                                        // show a message box using rfd
+                                        rfd::MessageDialog::new()
+                                            .set_title("Extraction Completed")
+                                            .set_description(&format!(
+                                                "Extraction completed to {}",
+                                                output_folder.display()
+                                            ))
+                                            .set_level(rfd::MessageLevel::Info)
+                                            .show();
+                                    }
+                                    Err(e) => {
+                                        // show error message box
+                                        rfd::MessageDialog::new()
+                                            .set_title("Extraction Failed")
+                                            .set_description(&format!("Extraction failed: {}", e))
+                                            .set_level(rfd::MessageLevel::Error)
+                                            .show();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             });
-            println!("All files extracted successfully.");
-            std::process::exit(0);
-        }
-        "t" => {
-            let zip_path = std::path::Path::new(&args[2]);
-            let possible_encodings = get_possible_encodings(zip_path);
-            println!("Possible encodings:");
-            println!("{}", possible_encodings.iter().map(|e| e.name()).collect::<Vec<&str>>().join(", "));
-        }
-        "s" => {
-            let zip_path = std::path::Path::new(&args[2]);
-            if args.len() > 3 {
-                let enc_name = &args[3];
-                let encoding = ENCODINGS.iter().find(|e| e.name() == enc_name.as_str()).copied().unwrap_or_else(|| {
-                    eprintln!("Error: Encoding '{}' not found.", enc_name);
-                    std::process::exit(1);
-                });
-                print_file_path_with_decoding(zip_path, encoding);
-            } else {
-                let possible_encodings = get_possible_encodings(zip_path);
-                println!("Possible encodings:");
-                println!("{}", possible_encodings.iter().map(|e| e.name()).collect::<Vec<&str>>().join(", "));
-                for enc in possible_encodings {
-                    print_file_path_with_decoding(zip_path, enc);
+
+            ui.separator();
+
+            if let Some(encoding) = self.current_encoding {
+                ComboBox::from_label("Select Encoding")
+                    .selected_text(encoding.name())
+                    .show_ui(ui, |ui| {
+                        for &enc in &self.possible_encodings {
+                            ui.selectable_value(&mut self.ui_encoding, Some(enc), enc.name());
+                        }
+                        ui.label("Encodings blow encountered errors:");
+                        for &enc in &self.other_encodings {
+                            ui.selectable_value(&mut self.ui_encoding, Some(enc), enc.name());
+                        }
+                    });
+                if self.ui_encoding != self.current_encoding {
+                    self.current_encoding = self.ui_encoding;
+                    self.zip_file_names.clear();
+                    self.zip_file_names = unziptools::get_decoded_file_names(
+                        self.zip_archive.as_mut().unwrap(),
+                        self.current_encoding.unwrap_or(UTF_8),
+                    );
                 }
             }
-        }
-        _ => {
-            eprintln!("{}", USAGE.replace("{0}", &args[0]));
-            std::process::exit(1);
+
+            if self.zip_archive.is_some() {
+                ui.separator();
+                ui.label(format!("Archive entries preview with encoding above:"));
+                // rolling area for file names
+                egui::ScrollArea::vertical()
+                    .max_height(300.0)
+                    .show(ui, |ui| {
+                        for name in self.zip_file_names.iter() {
+                            ui.label(name);
+                        }
+                    });
+            }
+        });
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn load_system_fonts() -> FontDefinitions {
+    // This function is intentionally left empty as the font loading is handled in main.
+    let mut fonts = FontDefinitions::default();
+
+    // Try common local font paths (Windows). Add more paths if needed for other platforms.
+    let candidates = [
+        ("noto-emoji", "C:\\Windows\\Fonts\\seguiemj.ttf"),
+        ("msyh", "C:\\Windows\\Fonts\\msyh.ttc"),
+        ("simsun", "C:\\Windows\\Fonts\\simsun.ttc"),
+        ("simhei", "C:\\Windows\\Fonts\\simhei.ttf"),
+        ("arial-unicode", "C:\\Windows\\Fonts\\ARIALUNI.TTF"),
+    ];
+
+    for (name, path) in candidates.iter() {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts
+                .font_data
+                .insert((*name).to_string(), Arc::new(FontData::from_owned(bytes)));
         }
     }
+
+    // Prepend any loaded fonts to proportional and monospace families so they are used first.
+    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+        let fam = fonts.families.entry(family).or_default();
+        for key in ["noto-emoji", "msyh", "simsun", "simhei", "arial-unicode"].iter() {
+            if fonts.font_data.contains_key(&key.to_string()) && !fam.contains(&key.to_string()) {
+                fam.insert(0, key.to_string());
+            }
+        }
+    }
+    fonts
+}
+
+#[cfg(target_os = "linux")]
+fn load_system_fonts() -> FontDefinitions {
+    let mut fonts = FontDefinitions::default();
+
+    // Try common local font paths (Linux). Add more paths if needed for other platforms.
+    let candidates = [
+        ("noto-emoji", "/usr/share/fonts/noto/NotoColorEmoji.ttf"),
+        ("msyh", "/usr/share/fonts/truetype/msyh.ttc"),
+        ("simsun", "/usr/share/fonts/truetype/simsun.ttc"),
+        ("simhei", "/usr/share/fonts/truetype/simhei.ttf"),
+        ("arial-unicode", "/usr/share/fonts/truetype/arialuni.ttf"),
+    ];
+
+    for (name, path) in candidates.iter() {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts
+                .font_data
+                .insert((*name).to_string(), Arc::new(FontData::from_owned(bytes)));
+        }
+    }
+
+    // Prepend any loaded fonts to proportional and monospace families so they are used first.
+    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+        let fam = fonts.families.entry(family).or_default();
+        for key in ["noto-emoji", "msyh", "simsun", "simhei", "arial-unicode"].iter() {
+            if fonts.font_data.contains_key(&key.to_string()) && !fam.contains(&key.to_string()) {
+                fam.insert(0, key.to_string());
+            }
+        }
+    }
+    fonts
+}
+
+// write a gui with egui
+fn main() {
+    let options = eframe::NativeOptions::default();
+    let _ = eframe::run_native(
+        "Zip Extractor",
+        options,
+        Box::new(|cc| {
+            cc.egui_ctx.set_fonts(load_system_fonts());
+
+            Ok(Box::new(ZipExtractor {
+                zip_path: PathBuf::from("."),
+                zip_archive: None,
+                current_encoding: None,
+                possible_encodings: vec![],
+                other_encodings: vec![],
+                zip_file_names: vec![],
+                ui_encoding: UTF_8.into(),
+            }))
+        }),
+    );
 }
