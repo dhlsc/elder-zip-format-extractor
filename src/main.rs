@@ -19,48 +19,89 @@ struct ZipExtractor {
     ui_encoding: Option<&'static Encoding>,
 }
 
+impl ZipExtractor {
+    fn new() -> Self {
+        Self {
+            zip_path: PathBuf::from("."),
+            zip_archive: None,
+            current_encoding: None,
+            possible_encodings: Vec::new(),
+            other_encodings: Vec::new(),
+            zip_file_names: Vec::new(),
+            ui_encoding: Some(UTF_8),
+        }
+    }
+
+    fn load_archive(&mut self, path: &Path) -> bool {
+        match File::open(path) {
+            Ok(file) => match ZipArchive::new(file) {
+                Ok(archive) => {
+                    self.zip_archive = Some(archive);
+                    self.zip_path = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+
+                    self.possible_encodings.clear();
+                    self.other_encodings.clear();
+                    self.zip_file_names.clear();
+                    self.current_encoding = None;
+                    self.ui_encoding = None;
+
+                    if let Some(archive) = self.zip_archive.as_mut() {
+                        let possible_encodings = if unziptools::is_all_utf8_encoded(archive) {
+                            vec![UTF_8]
+                        } else {
+                            unziptools::get_possible_encodings(archive)
+                        };
+                        let (possible_encodings, other_encodings) =
+                            unziptools::partition_encodings(&possible_encodings);
+
+                        self.possible_encodings = possible_encodings;
+                        self.other_encodings = other_encodings;
+
+                        if let Some(encoding) = self.possible_encodings.first().copied() {
+                            self.current_encoding = Some(encoding);
+                            self.ui_encoding = self.current_encoding;
+                            self.zip_file_names =
+                                unziptools::get_decoded_file_names(archive, encoding);
+                        }
+                    }
+
+                    true
+                }
+                Err(e) => {
+                    eprintln!("Failed to read zip: {}", e);
+                    false
+                }
+            },
+            Err(e) => {
+                eprintln!("Failed to open file: {}", e);
+                false
+            }
+        }
+    }
+
+    fn update_preview_for_encoding(&mut self) {
+        if self.ui_encoding == self.current_encoding {
+            return;
+        }
+
+        self.current_encoding = self.ui_encoding;
+        self.zip_file_names.clear();
+
+        if let Some(archive) = self.zip_archive.as_mut() {
+            if let Some(encoding) = self.current_encoding {
+                self.zip_file_names = unziptools::get_decoded_file_names(archive, encoding);
+            }
+        }
+    }
+}
+
 impl eframe::App for ZipExtractor {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Open").clicked() {
                     if let Some(path) = FileDialog::new().add_filter("zip", &["zip"]).pick_file() {
-                        match File::open(path.as_path()) {
-                            Ok(f) => match ZipArchive::new(f) {
-                                Ok(za) => {
-                                    self.zip_archive = Some(za);
-                                    self.zip_path =
-                                        path.parent().unwrap_or(Path::new(".")).to_path_buf();
-                                    if unziptools::is_all_utf8_encoded(self.zip_archive.as_mut().unwrap()) {
-                                        self.possible_encodings.push(UTF_8);
-                                    } else {
-                                        self.possible_encodings =
-                                            unziptools::get_possible_encodings(
-                                                self.zip_archive.as_mut().unwrap(),
-                                            );
-                                    }
-                                    if !self.possible_encodings.is_empty() {
-                                        self.current_encoding = Some(self.possible_encodings[0]);
-                                        self.other_encodings = unziptools::ENCODINGS
-                                            .iter()
-                                            .cloned()
-                                            .filter(|&e| !self.possible_encodings.contains(&e))
-                                            .collect();
-                                        self.ui_encoding = self.current_encoding;
-                                        self.zip_file_names = unziptools::get_decoded_file_names(
-                                            self.zip_archive.as_mut().unwrap(),
-                                            self.current_encoding.unwrap_or(UTF_8),
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to read zip: {}", e);
-                                }
-                            },
-                            Err(e) => {
-                                eprintln!("Failed to open file: {}", e);
-                            }
-                        }
+                        self.load_archive(path.as_path());
                     }
                 }
 
@@ -108,22 +149,16 @@ impl eframe::App for ZipExtractor {
                 ComboBox::from_label("Select Encoding")
                     .selected_text(encoding.name())
                     .show_ui(ui, |ui| {
+                        ui.label("Encodings that work:");
                         for &enc in &self.possible_encodings {
                             ui.selectable_value(&mut self.ui_encoding, Some(enc), enc.name());
                         }
-                        ui.label("Encodings blow encountered errors:");
+                        ui.label("Encodings that encountered errors:");
                         for &enc in &self.other_encodings {
                             ui.selectable_value(&mut self.ui_encoding, Some(enc), enc.name());
                         }
                     });
-                if self.ui_encoding != self.current_encoding {
-                    self.current_encoding = self.ui_encoding;
-                    self.zip_file_names.clear();
-                    self.zip_file_names = unziptools::get_decoded_file_names(
-                        self.zip_archive.as_mut().unwrap(),
-                        self.current_encoding.unwrap_or(UTF_8),
-                    );
-                }
+                self.update_preview_for_encoding();
             }
 
             if self.zip_archive.is_some() {
@@ -142,12 +177,28 @@ impl eframe::App for ZipExtractor {
     }
 }
 
+fn load_font_candidates(fonts: &mut FontDefinitions, candidates: &[(&str, &str)]) {
+    for (name, path) in candidates.iter().copied() {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts
+                .font_data
+                .insert(name.to_string(), Arc::new(FontData::from_owned(bytes)));
+        }
+    }
+
+    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+        let fam = fonts.families.entry(family).or_default();
+        for key in ["noto-emoji", "msyh", "simsun", "simhei", "arial-unicode"].iter() {
+            if fonts.font_data.contains_key(&key.to_string()) && !fam.contains(&key.to_string()) {
+                fam.insert(0, key.to_string());
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn load_system_fonts() -> FontDefinitions {
-    // This function is intentionally left empty as the font loading is handled in main.
     let mut fonts = FontDefinitions::default();
-
-    // Try common local font paths (Windows). Add more paths if needed for other platforms.
     let candidates = [
         ("noto-emoji", "C:\\Windows\\Fonts\\seguiemj.ttf"),
         ("msyh", "C:\\Windows\\Fonts\\msyh.ttc"),
@@ -155,32 +206,13 @@ fn load_system_fonts() -> FontDefinitions {
         ("simhei", "C:\\Windows\\Fonts\\simhei.ttf"),
         ("arial-unicode", "C:\\Windows\\Fonts\\ARIALUNI.TTF"),
     ];
-
-    for (name, path) in candidates.iter() {
-        if let Ok(bytes) = std::fs::read(path) {
-            fonts
-                .font_data
-                .insert((*name).to_string(), Arc::new(FontData::from_owned(bytes)));
-        }
-    }
-
-    // Prepend any loaded fonts to proportional and monospace families so they are used first.
-    for family in [FontFamily::Proportional, FontFamily::Monospace] {
-        let fam = fonts.families.entry(family).or_default();
-        for key in ["noto-emoji", "msyh", "simsun", "simhei", "arial-unicode"].iter() {
-            if fonts.font_data.contains_key(&key.to_string()) && !fam.contains(&key.to_string()) {
-                fam.insert(0, key.to_string());
-            }
-        }
-    }
+    load_font_candidates(&mut fonts, &candidates);
     fonts
 }
 
 #[cfg(target_os = "linux")]
 fn load_system_fonts() -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
-
-    // Try common local font paths (Linux). Add more paths if needed for other platforms.
     let candidates = [
         ("noto-emoji", "/usr/share/fonts/noto/NotoColorEmoji.ttf"),
         ("msyh", "/usr/share/fonts/truetype/msyh.ttc"),
@@ -188,24 +220,7 @@ fn load_system_fonts() -> FontDefinitions {
         ("simhei", "/usr/share/fonts/truetype/simhei.ttf"),
         ("arial-unicode", "/usr/share/fonts/truetype/arialuni.ttf"),
     ];
-
-    for (name, path) in candidates.iter() {
-        if let Ok(bytes) = std::fs::read(path) {
-            fonts
-                .font_data
-                .insert((*name).to_string(), Arc::new(FontData::from_owned(bytes)));
-        }
-    }
-
-    // Prepend any loaded fonts to proportional and monospace families so they are used first.
-    for family in [FontFamily::Proportional, FontFamily::Monospace] {
-        let fam = fonts.families.entry(family).or_default();
-        for key in ["noto-emoji", "msyh", "simsun", "simhei", "arial-unicode"].iter() {
-            if fonts.font_data.contains_key(&key.to_string()) && !fam.contains(&key.to_string()) {
-                fam.insert(0, key.to_string());
-            }
-        }
-    }
+    load_font_candidates(&mut fonts, &candidates);
     fonts
 }
 
@@ -218,15 +233,7 @@ fn main() {
         Box::new(|cc| {
             cc.egui_ctx.set_fonts(load_system_fonts());
 
-            Ok(Box::new(ZipExtractor {
-                zip_path: PathBuf::from("."),
-                zip_archive: None,
-                current_encoding: None,
-                possible_encodings: vec![],
-                other_encodings: vec![],
-                zip_file_names: vec![],
-                ui_encoding: UTF_8.into(),
-            }))
+            Ok(Box::new(ZipExtractor::new()))
         }),
     );
 }
